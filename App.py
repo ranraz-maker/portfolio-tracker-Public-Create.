@@ -1,5 +1,8 @@
+# App.py
 import math, time, io, csv, requests
 import numpy as np, pandas as pd, streamlit as st
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 st.set_page_config(page_title="Aggressive but Balanced – 1M Tracker", layout="wide")
 st.write("✅ App booted… loading quotes")
@@ -86,7 +89,6 @@ def stooq_quotes(symbols: list[str]) -> dict[str, tuple[float,float]]:
     rev = {v: k for k, v in mapped.items()}
     for row in reader:
         sym = row.get("Symbol")
-        # Map back to original if possible
         orig = rev.get(sym, sym)
         try:
             close = float(row.get("Close") or "nan")
@@ -106,7 +108,6 @@ def fetch_quotes(symbols: list[str]) -> dict[str, tuple[float,float]]:
                 yahoo_out = yahoo_quotes(symbols)
                 break
             except requests.HTTPError as e:
-                # 401/403 often; backoff once
                 if e.response is not None and e.response.status_code in (401,403):
                     time.sleep(1.0 + i)
                     continue
@@ -131,14 +132,37 @@ def fetch_quotes(symbols: list[str]) -> dict[str, tuple[float,float]]:
             out[s] = stooq_out.get(s, (float("nan"), float("nan")))
     return out
 
-# ---------- Get quotes ----------
+# ---- Yahoo history for backtest ----
+def yahoo_history(symbol: str, start_dt: datetime, end_dt: datetime, interval: str = "1d") -> pd.Series:
+    """
+    Fetch daily close series (float) for symbol between start_dt and end_dt inclusive (UTC dates).
+    """
+    period1 = int(start_dt.replace(tzinfo=ZoneInfo("UTC")).timestamp())
+    period2 = int((end_dt + timedelta(days=1)).replace(tzinfo=ZoneInfo("UTC")).timestamp())
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+    params = {"period1": period1, "period2": period2, "interval": interval, "events": "div,splits"}
+    r = requests.get(url, params=params, headers=UA, timeout=10)
+    r.raise_for_status()
+    j = r.json()
+    res = j.get("chart", {}).get("result", [])
+    if not res:
+        return pd.Series(dtype="float64")
+    res = res[0]
+    closes = res.get("indicators", {}).get("quote", [{}])[0].get("close", [])
+    ts = res.get("timestamp", [])
+    if not closes or not ts:
+        return pd.Series(dtype="float64")
+    idx = pd.to_datetime(ts, unit="s", utc=True).date
+    return pd.Series(closes, index=pd.Index(idx, name="date"), dtype="float64").dropna()
+
+# ---------- Get quotes (snapshot) ----------
 try:
     quotes = fetch_quotes(TICKERS)
 except Exception as e:
     st.error(f"Price download failed. Please refresh in a minute. Details: {e}")
     st.stop()
 
-# ---------- Build table ----------
+# ---------- Build snapshot table ----------
 rows = []
 for t in TICKERS:
     price, prev = quotes.get(t, (float("nan"), float("nan")))
@@ -161,8 +185,8 @@ tbl = pd.DataFrame(rows)
 tbl["Δ Value $"] = (tbl["Position Value $"] - tbl["Alloc $"]).round(2)
 tbl["Δ %"] = ((tbl["Position Value $"] / tbl["Alloc $"] - 1.0) * 100.0).replace([np.inf, -np.inf], 0).fillna(0).round(2)
 
-# ---------- Display ----------
-st.subheader("Holdings")
+# ---------- Snapshot (top) ----------
+st.subheader("Holdings (snapshot)")
 st.dataframe(tbl, use_container_width=True)
 
 c1, c2, c3 = st.columns(3)
@@ -173,4 +197,84 @@ c1.metric("Total Value ($)", f"{total_val:,.2f}")
 c2.metric("Daily P/L ($)",   f"{pl_val:,.2f}")
 c3.metric("Daily P/L (%)",   f"{pl_pct:.2f}%")
 
-st.caption("Quotes cached ~60s. Yahoo first, Stooq fallback for unavailable symbols.")
+# ---------- Backtest window controls ----------
+st.sidebar.markdown("---")
+st.sidebar.subheader("Backtest window")
+preset = st.sidebar.selectbox("Preset", ["1W","1M","3M","6M","1Y","Custom"], index=2)
+
+today_local = datetime.now(ZoneInfo("Asia/Jerusalem")).date()
+if preset == "1W":
+    start_date = today_local - timedelta(days=7)
+    end_date = today_local
+elif preset == "1M":
+    start_date = today_local - timedelta(days=30)
+    end_date = today_local
+elif preset == "3M":
+    start_date = today_local - timedelta(days=90)
+    end_date = today_local
+elif preset == "6M":
+    start_date = today_local - timedelta(days=182)
+    end_date = today_local
+elif preset == "1Y":
+    start_date = today_local - timedelta(days=365)
+    end_date = today_local
+else:
+    start_date = st.sidebar.date_input("Start date", today_local - timedelta(days=90))
+    end_date   = st.sidebar.date_input("End date", today_local)
+
+if start_date > end_date:
+    st.sidebar.error("Start date must be on/before End date.")
+    st.stop()
+
+# ---------- Portfolio value over time (middle) ----------
+st.subheader("Portfolio value over time")
+hist_map = {}
+for t in TICKERS:
+    try:
+        s = yahoo_history(
+            t,
+            datetime.combine(start_date, datetime.min.time()),
+            datetime.combine(end_date,   datetime.min.time())
+        )
+        if not s.empty:
+            hist_map[t] = s
+    except Exception:
+        pass
+
+if not hist_map:
+    st.warning("No historical data available for the selected window.")
+else:
+    prices = pd.DataFrame(hist_map).dropna(how="any")
+    if prices.empty:
+        st.warning("No overlapping dates across tickers in the selected range.")
+    else:
+        first_row = prices.iloc[0]
+        units = {}
+        for t in TICKERS:
+            if t in prices.columns and first_row[t] and not math.isnan(first_row[t]) and first_row[t] > 0:
+                units[t] = (total_usd * weights[t]) / first_row[t]
+            else:
+                units[t] = 0.0
+
+        port_val = (prices * pd.Series(units)).sum(axis=1)
+        port_val.name = "Portfolio Value ($)"
+
+        start_val = float(port_val.iloc[0])
+        end_val   = float(port_val.iloc[-1])
+        ret_pct   = (end_val/start_val - 1.0) * 100.0 if start_val > 0 else 0.0
+        cum_max = port_val.cummax()
+        drawdown = (port_val / cum_max - 1.0)
+        max_dd = float(drawdown.min() * 100.0)
+
+        st.line_chart(port_val)
+
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Start value", f"${start_val:,.2f}")
+        d2.metric("End value",   f"${end_val:,.2f}", f"{ret_pct:.2f}%")
+        d3.metric("Max drawdown", f"{max_dd:.2f}%")
+
+        csv_bytes = port_val.to_frame().to_csv(index=True).encode()
+        st.download_button("Download portfolio history (CSV)", csv_bytes,
+                           file_name="portfolio_history.csv", mime="text/csv")
+
+st.caption("Quotes cached ~60s; history cached ~10 min. Yahoo first; Stooq fallback for gaps.")
