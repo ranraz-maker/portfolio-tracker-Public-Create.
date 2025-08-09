@@ -3,6 +3,7 @@ import math, time, io, csv, requests
 import numpy as np, pandas as pd, streamlit as st
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+import altair as alt
 
 st.set_page_config(page_title="Aggressive but Balanced – 1M Tracker", layout="wide")
 st.write("✅ App booted… loading quotes")
@@ -43,12 +44,11 @@ if abs(s - 1.0) > 1e-6:
     st.stop()
 
 st.title("Aggressive but Balanced – 1‑Month Portfolio Tracker")
-st.caption("Live prices (Yahoo first, Stooq fallback) + P/L, history, and a simple forecast. Info only — not investment advice.")
+st.caption("Live prices (Yahoo first, Stooq fallback), history, drawdown, and a simple forecast. Info only — not investment advice.")
 
 # ---------- Live quote fetchers ----------
 @st.cache_data(ttl=60)
 def yahoo_quotes(symbols: tuple[str, ...]) -> dict[str, tuple[float,float]]:
-    """Primary: Yahoo v7 quote JSON with full headers."""
     url = "https://query1.finance.yahoo.com/v7/finance/quote"
     r = requests.get(url, params={"symbols": ",".join(symbols)}, headers=UA, timeout=10)
     r.raise_for_status()
@@ -65,10 +65,9 @@ def yahoo_quotes(symbols: tuple[str, ...]) -> dict[str, tuple[float,float]]:
     return out
 
 def stooq_symbols(symbols: list[str]) -> dict[str, str]:
-    """Map to Stooq tickers (US stocks/ETFs often need .US)."""
     m = {}
     for s in symbols:
-        if "." in s:  # e.g., BRK.B
+        if "." in s:
             m[s] = s.replace(".", "-").upper()
         else:
             m[s] = f"{s}.US"
@@ -76,7 +75,6 @@ def stooq_symbols(symbols: list[str]) -> dict[str, str]:
 
 @st.cache_data(ttl=300)
 def stooq_quotes(symbols: tuple[str, ...]) -> dict[str, tuple[float,float]]:
-    """Fallback: Stooq CSV (no key). Returns last close and prev proxy (open)."""
     mapped = stooq_symbols(list(symbols))
     url = "https://stooq.com/q/l/"
     params = {"s": ",".join(mapped.values()), "f": "sd2t2ohlcv", "h": "", "e": "csv"}
@@ -90,16 +88,14 @@ def stooq_quotes(symbols: tuple[str, ...]) -> dict[str, tuple[float,float]]:
         orig = rev.get(sym, sym)
         try:
             close = float(row.get("Close") or "nan")
-            prev  = float(row.get("Open") or "nan")  # Stooq lacks prev close; Open as rough proxy
+            prev  = float(row.get("Open") or "nan")
         except ValueError:
             close, prev = float("nan"), float("nan")
         out[orig.replace("-", ".")] = (close, prev)
     return out
 
 def fetch_quotes(symbols: list[str]) -> dict[str, tuple[float,float]]:
-    """Try Yahoo with retries; fill gaps from Stooq."""
     syms_tuple = tuple(symbols)
-    # 1) Yahoo (up to 2 tries)
     yahoo_out = {}
     try:
         for i in range(2):
@@ -113,7 +109,6 @@ def fetch_quotes(symbols: list[str]) -> dict[str, tuple[float,float]]:
                 raise
     except Exception:
         yahoo_out = {}
-    # 2) Fill missing with Stooq
     missing = [s for s in symbols if s not in yahoo_out or math.isnan(yahoo_out[s][0])]
     stq_out = {}
     if missing:
@@ -132,9 +127,8 @@ def fetch_quotes(symbols: list[str]) -> dict[str, tuple[float,float]]:
 # ---- Yahoo history (for backtest) ----
 @st.cache_data(ttl=600)
 def yahoo_history(symbol: str, start_dt: datetime, end_dt: datetime, interval: str = "1d") -> pd.Series:
-    """Fetch daily close series for symbol between start_dt and end_dt inclusive (UTC dates)."""
     p1 = int(start_dt.replace(tzinfo=ZoneInfo("UTC")).timestamp())
-    p2 = int((end_dt + timedelta(days=1)).replace(tzinfo=ZoneInfo("UTC")).timestamp())  # inclusive end
+    p2 = int((end_dt + timedelta(days=1)).replace(tzinfo=ZoneInfo("UTC")).timestamp())
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     r = requests.get(url, params={"period1": p1, "period2": p2, "interval": interval, "events": "div,splits"},
                      headers=UA, timeout=10)
@@ -219,7 +213,6 @@ if start_date > end_date:
 # ---------- Portfolio value over time (no rebalancing) ----------
 st.subheader("Portfolio value over time")
 
-# Fetch aligned history
 hist_map = {}
 for t in TICKERS:
     try:
@@ -240,7 +233,6 @@ else:
     if prices.empty:
         st.warning("No overlapping dates across tickers in the selected range.")
     else:
-        # Units = starting USD allocation / price at first date
         first_row = prices.iloc[0]
         units = {}
         for t in TICKERS:
@@ -249,11 +241,9 @@ else:
             else:
                 units[t] = 0.0
 
-        # Value series in USD
         port_val = (prices * pd.Series(units)).sum(axis=1)
         port_val.name = "Portfolio Value ($)"
 
-        # % series vs start
         start_val = float(port_val.iloc[0])
         port_pct = (port_val / start_val - 1.0) * 100.0 if start_val > 0 else port_val*0
         port_pct.name = "Return (%)"
@@ -272,11 +262,34 @@ else:
         ret_usd   = end_val - start_val
         ret_pct   = (end_val/start_val - 1.0) * 100.0 if start_val > 0 else 0.0
 
-        # --- Charts (two synced views) ---
-        st.markdown("**USD value**")
-        st.line_chart(port_val)
-        st.markdown("**% change from start**")
-        st.line_chart(port_pct)
+        # --- Charts with explicit axes (Altair) ---
+        val_df = port_val.reset_index()
+        val_df.columns = ["date","value_usd"]
+        chart_val = (
+            alt.Chart(val_df)
+            .mark_line()
+            .encode(
+                x=alt.X("date:T", title="Date"),
+                y=alt.Y("value_usd:Q", title="Portfolio Value ($)", axis=alt.Axis(format="$,.0f")),
+                tooltip=[alt.Tooltip("date:T"), alt.Tooltip("value_usd:Q", format="$,.2f")]
+            )
+            .properties(height=260)
+        )
+        st.altair_chart(chart_val, use_container_width=True)
+
+        pct_df = port_pct.reset_index()
+        pct_df.columns = ["date","ret_pct"]
+        chart_pct = (
+            alt.Chart(pct_df)
+            .mark_line()
+            .encode(
+                x=alt.X("date:T", title="Date"),
+                y=alt.Y("ret_pct:Q", title="Return (%)", axis=alt.Axis(format=".1f")),
+                tooltip=[alt.Tooltip("date:T"), alt.Tooltip("ret_pct:Q", format=".2f")]
+            )
+            .properties(height=220)
+        )
+        st.altair_chart(chart_pct, use_container_width=True)
 
         # --- Metrics ---
         d1, d2, d3, d4, d5 = st.columns(5)
@@ -298,11 +311,9 @@ else:
         n_sims       = fc_col2.number_input("Simulations", min_value=200, max_value=5000, value=2000, step=100)
         use_window   = fc_col3.selectbox("Return source", ["This window", "Last 3M"], index=0)
 
-        # Build daily portfolio returns to sample from
         if use_window == "This window":
             ret_series = port_val.pct_change().dropna()
         else:
-            # rebuild a 3M history (independent of display window)
             hist3m = {}
             s3_start = today_local - timedelta(days=90)
             s3_end   = today_local
@@ -346,12 +357,29 @@ else:
 
             p5, p50, p95 = np.percentile(sims_end, [5, 50, 95])
             st.write(f"**Projected end value (median)**: ${p50:,.2f}  |  **5%**: ${p5:,.2f}  |  **95%**: ${p95:,.2f}")
-
             prob_prof = float((sims_end > last_val).mean() * 100.0)
             st.write(f"**Probability of profit over {int(horizon_days)} days:** {prob_prof:.1f}%")
 
-            # Small histogram
-            hist_counts = pd.Series(sims_end).value_counts(bins=30, sort=False)
-            st.bar_chart(hist_counts.reset_index(drop=True))
+            sim_df = pd.DataFrame({"end_value": sims_end})
+            hist = (
+                alt.Chart(sim_df)
+                .mark_bar()
+                .encode(
+                    x=alt.X("end_value:Q", bin=alt.Bin(maxbins=30), title="Simulated end value ($)", axis=alt.Axis(format="$,.0f")),
+                    y=alt.Y("count():Q", title="Frequency"),
+                    tooltip=[alt.Tooltip("count():Q"), alt.Tooltip("end_value:Q", bin=True, format="$,.0f")]
+                )
+                .properties(height=260)
+            )
+            rules = alt.Chart(pd.DataFrame({
+                "label": ["Current", "Median", "5th %", "95th %"],
+                "x":     [last_val, p50, p5, p95]
+            })).mark_rule(color="red").encode(x="x:Q")
+            labels = alt.Chart(pd.DataFrame({
+                "text":  ["Current", "Median", "5th %", "95th %"],
+                "x":     [last_val, p50, p5, p95],
+                "y":     [0, 0, 0, 0]
+            })).mark_text(angle=90, dy=-10, color="red").encode(x="x:Q", text="text:N")
+            st.altair_chart(hist + rules + labels, use_container_width=True)
 
 st.caption("Quotes cached ~60s; history cached ~10 min. Yahoo first; Stooq fallback for gaps.")
