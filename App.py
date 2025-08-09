@@ -44,7 +44,7 @@ if abs(s - 1.0) > 1e-6:
     st.stop()
 
 st.title("Aggressive but Balanced – 1‑Month Portfolio Tracker")
-st.caption("Live prices (Yahoo first, Stooq fallback), history, drawdown, and a simple forecast. Info only — not investment advice.")
+st.caption("Live prices (Yahoo first, Stooq fallback), history, drawdown, and a probability‑view forecast. Not investment advice.")
 
 # ---------- Live quote fetchers ----------
 @st.cache_data(ttl=60)
@@ -104,44 +104,37 @@ def fetch_quotes(symbols: list[str]) -> dict[str, tuple[float,float]]:
                 break
             except requests.HTTPError as e:
                 if e.response is not None and e.response.status_code in (401,403):
-                    time.sleep(1.0 + i)
-                    continue
+                    time.sleep(1.0 + i); continue
                 raise
     except Exception:
         yahoo_out = {}
     missing = [s for s in symbols if s not in yahoo_out or math.isnan(yahoo_out[s][0])]
     stq_out = {}
     if missing:
-        try:
-            stq_out = stooq_quotes(tuple(missing))
-        except Exception:
-            pass
+        try: stq_out = stooq_quotes(tuple(missing))
+        except Exception: pass
     out = {}
     for s in symbols:
-        if s in yahoo_out and not math.isnan(yahoo_out[s][0]):
-            out[s] = yahoo_out[s]
-        else:
-            out[s] = stq_out.get(s, (float("nan"), float("nan")))
+        if s in yahoo_out and not math.isnan(yahoo_out[s][0]): out[s] = yahoo_out[s]
+        else: out[s] = stq_out.get(s, (float("nan"), float("nan")))
     return out
 
 # ---- Yahoo history (for backtest) ----
 @st.cache_data(ttl=600)
 def yahoo_history(symbol: str, start_dt: datetime, end_dt: datetime, interval: str = "1d") -> pd.Series:
     p1 = int(start_dt.replace(tzinfo=ZoneInfo("UTC")).timestamp())
-    p2 = int((end_dt + timedelta(days=1)).replace(tzinfo=ZoneInfo("UTC")).timestamp())
+    p2 = int((end_dt + timedelta(days=1)).replace(tzinfo=ZoneInfo("UTC")).timestamp())  # inclusive
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     r = requests.get(url, params={"period1": p1, "period2": p2, "interval": interval, "events": "div,splits"},
                      headers=UA, timeout=10)
     r.raise_for_status()
     j = r.json()
     res = j.get("chart", {}).get("result", [])
-    if not res:
-        return pd.Series(dtype="float64")
+    if not res: return pd.Series(dtype="float64")
     res = res[0]
     closes = res.get("indicators", {}).get("quote", [{}])[0].get("close", [])
     ts = res.get("timestamp", [])
-    if not closes or not ts:
-        return pd.Series(dtype="float64")
+    if not closes or not ts: return pd.Series(dtype="float64")
     idx = pd.to_datetime(ts, unit="s", utc=True).date
     return pd.Series(closes, index=pd.Index(idx, name="date"), dtype="float64").dropna()
 
@@ -155,8 +148,7 @@ except Exception as e:
 rows = []
 for t in TICKERS:
     price, prev = quotes.get(t, (float("nan"), float("nan")))
-    if math.isnan(prev) or prev == 0:
-        prev = price
+    if math.isnan(prev) or prev == 0: prev = price
     day_pct = (price/prev - 1.0) * 100.0 if (price and prev and not math.isnan(price) and not math.isnan(prev)) else 0.0
     alloc = total_usd * weights[t]
     units = alloc / price if (price and not math.isnan(price) and price > 0) else 0.0
@@ -201,14 +193,10 @@ elif preset == "6M":
 elif preset == "1Y":
     start_date = today_local - timedelta(days=365); end_date = today_local
 else:
-    with c2:
-        start_date = st.date_input("Start date", today_local - timedelta(days=90), key="bt_start")
-    with c3:
-        end_date   = st.date_input("End date", today_local, key="bt_end")
-
+    with c2: start_date = st.date_input("Start date", today_local - timedelta(days=90), key="bt_start")
+    with c3: end_date   = st.date_input("End date", today_local, key="bt_end")
 if start_date > end_date:
-    st.error("Start date must be on/before End date.")
-    st.stop()
+    st.error("Start date must be on/before End date."); st.stop()
 
 # ---------- Portfolio value over time (no rebalancing) ----------
 st.subheader("Portfolio value over time")
@@ -221,10 +209,8 @@ for t in TICKERS:
             datetime.combine(start_date, datetime.min.time()),
             datetime.combine(end_date,   datetime.min.time())
         )
-        if not s.empty:
-            hist_map[t] = s
-    except Exception:
-        pass
+        if not s.empty: hist_map[t] = s
+    except Exception: pass
 
 if not hist_map:
     st.warning("No historical data available for the selected window.")
@@ -241,57 +227,44 @@ else:
             else:
                 units[t] = 0.0
 
-        port_val = (prices * pd.Series(units)).sum(axis=1)
-        port_val.name = "Portfolio Value ($)"
-
+        port_val = (prices * pd.Series(units)).sum(axis=1); port_val.name = "Portfolio Value ($)"
         start_val = float(port_val.iloc[0])
-        port_pct = (port_val / start_val - 1.0) * 100.0 if start_val > 0 else port_val*0
-        port_pct.name = "Return (%)"
+        port_pct = (port_val / start_val - 1.0) * 100.0 if start_val > 0 else port_val*0; port_pct.name = "Return (%)"
 
-        # --- Max Drawdown ($ and %) ---
+        # Max Drawdown
         cum_max = port_val.cummax()
         drawdown_pct = (port_val / cum_max - 1.0) * 100.0
         max_dd_pct = float(drawdown_pct.min())
-
         trough_idx = drawdown_pct.idxmin()
         peak_up_to_trough = cum_max.loc[:trough_idx].idxmax()
         mdd_usd = float(port_val.loc[trough_idx] - port_val.loc[peak_up_to_trough])
 
-        # Period P&L ($/%)
+        # Period P&L
         end_val   = float(port_val.iloc[-1])
         ret_usd   = end_val - start_val
         ret_pct   = (end_val/start_val - 1.0) * 100.0 if start_val > 0 else 0.0
 
-        # --- Charts with explicit axes (Altair) ---
-        val_df = port_val.reset_index()
-        val_df.columns = ["date","value_usd"]
+        # Charts (Altair, explicit axes)
+        val_df = port_val.reset_index(); val_df.columns = ["date","value_usd"]
         chart_val = (
-            alt.Chart(val_df)
-            .mark_line()
-            .encode(
+            alt.Chart(val_df).mark_line().encode(
                 x=alt.X("date:T", title="Date"),
                 y=alt.Y("value_usd:Q", title="Portfolio Value ($)", axis=alt.Axis(format="$,.0f")),
                 tooltip=[alt.Tooltip("date:T"), alt.Tooltip("value_usd:Q", format="$,.2f")]
-            )
-            .properties(height=260)
+            ).properties(height=260)
         )
         st.altair_chart(chart_val, use_container_width=True)
 
-        pct_df = port_pct.reset_index()
-        pct_df.columns = ["date","ret_pct"]
+        pct_df = port_pct.reset_index(); pct_df.columns = ["date","ret_pct"]
         chart_pct = (
-            alt.Chart(pct_df)
-            .mark_line()
-            .encode(
+            alt.Chart(pct_df).mark_line().encode(
                 x=alt.X("date:T", title="Date"),
                 y=alt.Y("ret_pct:Q", title="Return (%)", axis=alt.Axis(format=".1f")),
                 tooltip=[alt.Tooltip("date:T"), alt.Tooltip("ret_pct:Q", format=".2f")]
-            )
-            .properties(height=220)
+            ).properties(height=220)
         )
         st.altair_chart(chart_pct, use_container_width=True)
 
-        # --- Metrics ---
         d1, d2, d3, d4, d5 = st.columns(5)
         d1.metric("Start value", f"${start_val:,.2f}")
         d2.metric("End value",   f"${end_val:,.2f}", f"{ret_pct:.2f}%")
@@ -299,35 +272,32 @@ else:
         d4.metric("Max drawdown (%)", f"{max_dd_pct:.2f}%")
         d5.metric("Max drawdown ($)", f"{mdd_usd:,.2f}")
 
-        # CSV download
         csv_bytes = pd.concat([port_val, port_pct], axis=1).to_csv(index=True).encode()
         st.download_button("Download portfolio history (CSV)", csv_bytes,
                            file_name="portfolio_history.csv", mime="text/csv")
 
-        # ---------- Forecast (bootstrap; USD) ----------
-        st.markdown("### Forecast (experimental)")
+        # ---------- Forecast (probability view) ----------
+        st.markdown("### Forecast (probability view)")
+
         fc_col1, fc_col2, fc_col3 = st.columns([1,1,2])
         horizon_days = fc_col1.number_input("Horizon (trading days)", min_value=5, max_value=60, value=21, step=1)
-        n_sims       = fc_col2.number_input("Simulations", min_value=200, max_value=5000, value=2000, step=100)
+        n_sims       = fc_col2.number_input("Simulations", min_value=500, max_value=10000, value=4000, step=500)
         use_window   = fc_col3.selectbox("Return source", ["This window", "Last 3M"], index=0)
 
+        # Build daily returns for bootstrap
         if use_window == "This window":
             ret_series = port_val.pct_change().dropna()
         else:
             hist3m = {}
-            s3_start = today_local - timedelta(days=90)
-            s3_end   = today_local
+            s3_start = today_local - timedelta(days=90); s3_end = today_local
             for t in TICKERS:
                 try:
-                    s3 = yahoo_history(
-                        t,
+                    s3 = yahoo_history(t,
                         datetime.combine(s3_start, datetime.min.time()),
                         datetime.combine(s3_end,   datetime.min.time())
                     )
-                    if not s3.empty:
-                        hist3m[t] = s3
-                except Exception:
-                    pass
+                    if not s3.empty: hist3m[t] = s3
+                except Exception: pass
             if hist3m:
                 p3 = pd.DataFrame(hist3m).dropna(how="any")
                 if not p3.empty:
@@ -342,44 +312,82 @@ else:
             else:
                 ret_series = port_val.pct_change().dropna()
 
-        if ret_series.empty or start_val <= 0:
+        if ret_series.empty:
             st.info("Not enough data to simulate.")
         else:
-            rets = ret_series.values
             last_val = float(port_val.iloc[-1])
+            rets = ret_series.values
 
-            sims_end = []
+            sims_end, sims_ret = [], []
             for _ in range(int(n_sims)):
                 samp = np.random.choice(rets, size=int(horizon_days), replace=True)
                 growth = np.prod(1.0 + samp)
                 sims_end.append(last_val * growth)
+                sims_ret.append((growth - 1.0) * 100.0)
+
             sims_end = np.array(sims_end)
+            sims_ret = np.array(sims_ret)
 
+            # Probability curve: P(final return >= r)
+            r_grid = np.linspace(np.percentile(sims_ret, 1), np.percentile(sims_ret, 99), 200)
+            prob_ge = [(sims_ret >= r).mean()*100.0 for r in r_grid]
+            curve_df = pd.DataFrame({"Return %": r_grid, "Probability ≥ r": prob_ge})
+
+            # Risk stats
             p5, p50, p95 = np.percentile(sims_end, [5, 50, 95])
-            st.write(f"**Projected end value (median)**: ${p50:,.2f}  |  **5%**: ${p5:,.2f}  |  **95%**: ${p95:,.2f}")
-            prob_prof = float((sims_end > last_val).mean() * 100.0)
-            st.write(f"**Probability of profit over {int(horizon_days)} days:** {prob_prof:.1f}%")
+            ret5, ret50, ret95 = np.percentile(sims_ret, [5, 50, 95])
+            mean_end = sims_end.mean(); mean_ret = sims_ret.mean()
+            prob_profit = (sims_end > last_val).mean()*100.0
 
-            sim_df = pd.DataFrame({"end_value": sims_end})
-            hist = (
-                alt.Chart(sim_df)
-                .mark_bar()
-                .encode(
-                    x=alt.X("end_value:Q", bin=alt.Bin(maxbins=30), title="Simulated end value ($)", axis=alt.Axis(format="$,.0f")),
-                    y=alt.Y("count():Q", title="Frequency"),
-                    tooltip=[alt.Tooltip("count():Q"), alt.Tooltip("end_value:Q", bin=True, format="$,.0f")]
-                )
-                .properties(height=260)
+            # VaR/CVaR at 5%
+            var5_ret = np.percentile(sims_ret, 5)
+            cvar5_ret = sims_ret[sims_ret <= var5_ret].mean() if np.any(sims_ret <= var5_ret) else var5_ret
+
+            # Thresholds
+            levels = np.array([-5, -3, 0, 3, 5], dtype=float)
+            probs_levels = [(sims_ret >= L).mean()*100.0 for L in levels]
+
+            # Plot: Return threshold → Probability
+            chart_curve = (
+                alt.Chart(curve_df).mark_line().encode(
+                    x=alt.X("Return %:Q", title="Return over horizon (%)"),
+                    y=alt.Y("Probability ≥ r:Q", title="Probability (%)", scale=alt.Scale(domain=[0,100])),
+                    tooltip=[alt.Tooltip("Return %:Q", format=".1f"),
+                             alt.Tooltip("Probability ≥ r:Q", format=".1f")]
+                ).properties(height=260)
             )
-            rules = alt.Chart(pd.DataFrame({
-                "label": ["Current", "Median", "5th %", "95th %"],
-                "x":     [last_val, p50, p5, p95]
-            })).mark_rule(color="red").encode(x="x:Q")
-            labels = alt.Chart(pd.DataFrame({
-                "text":  ["Current", "Median", "5th %", "95th %"],
-                "x":     [last_val, p50, p5, p95],
-                "y":     [0, 0, 0, 0]
-            })).mark_text(angle=90, dy=-10, color="red").encode(x="x:Q", text="text:N")
-            st.altair_chart(hist + rules + labels, use_container_width=True)
+            st.altair_chart(chart_curve, use_container_width=True)
+
+            # Tables
+            summary = pd.DataFrame({
+                "Metric": [
+                    "Horizon (trading days)", "Start (current $)", "Mean end ($)", "Median end ($)",
+                    "5% end ($)", "95% end ($)", "Mean return (%)", "Median return (%)",
+                    "5% return (%)", "95% return (%)", "VaR 5% (return %)", "CVaR 5% (return %)",
+                    "Prob(final > current) %"
+                ],
+                "Value": [
+                    int(horizon_days), f"${last_val:,.2f}", f"${mean_end:,.2f}", f"${p50:,.2f}",
+                    f"${p5:,.2f}", f"${p95:,.2f}", f"{mean_ret:.2f}%", f"{ret50:.2f}%",
+                    f"{ret5:.2f}%", f"{ret95:.2f}%", f"{var5_ret:.2f}%", f"{cvar5_ret:.2f}%",
+                    f"{prob_profit:.1f}%"
+                ]
+            })
+            thresh = pd.DataFrame({
+                "Return threshold (%)": levels,
+                "Prob( ≥ threshold ) %": np.round(probs_levels, 1)
+            })
+
+            st.markdown("**Risk / Return summary**")
+            st.dataframe(summary, use_container_width=True)
+            st.markdown("**Threshold probabilities**")
+            st.dataframe(thresh, use_container_width=True)
+
+            # Downloads
+            dl1 = pd.DataFrame({"Sim end ($)": sims_end, "Sim return (%)": sims_ret}).to_csv(index=False).encode()
+            dl2 = curve_df.to_csv(index=False).encode()
+            cdl1, cdl2 = st.columns(2)
+            cdl1.download_button("Download simulations (CSV)", dl1, "simulations.csv", "text/csv")
+            cdl2.download_button("Download probability curve (CSV)", dl2, "prob_curve.csv", "text/csv")
 
 st.caption("Quotes cached ~60s; history cached ~10 min. Yahoo first; Stooq fallback for gaps.")
