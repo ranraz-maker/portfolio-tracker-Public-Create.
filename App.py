@@ -44,7 +44,7 @@ if abs(s - 1.0) > 1e-6:
     st.stop()
 
 st.title("Aggressive but Balanced – 1‑Month Portfolio Tracker")
-st.caption("Live prices (Yahoo first, Stooq fallback), history, drawdown, and a probability‑view forecast. Not investment advice.")
+st.caption("Live prices (Yahoo first, Stooq fallback), history, drawdown, timeframe‑linked table, and probability forecast. Not investment advice.")
 
 # ---------- Live quote fetchers ----------
 @st.cache_data(ttl=60)
@@ -67,7 +67,7 @@ def yahoo_quotes(symbols: tuple[str, ...]) -> dict[str, tuple[float,float]]:
 def stooq_symbols(symbols: list[str]) -> dict[str, str]:
     m = {}
     for s in symbols:
-        if "." in s:
+        if "." in s:  # e.g., BRK.B
             m[s] = s.replace(".", "-").upper()
         else:
             m[s] = f"{s}.US"
@@ -88,7 +88,7 @@ def stooq_quotes(symbols: tuple[str, ...]) -> dict[str, tuple[float,float]]:
         orig = rev.get(sym, sym)
         try:
             close = float(row.get("Close") or "nan")
-            prev  = float(row.get("Open") or "nan")
+            prev  = float(row.get("Open") or "nan")  # Stooq lacks prev close; Open as proxy
         except ValueError:
             close, prev = float("nan"), float("nan")
         out[orig.replace("-", ".")] = (close, prev)
@@ -96,6 +96,7 @@ def stooq_quotes(symbols: tuple[str, ...]) -> dict[str, tuple[float,float]]:
 
 def fetch_quotes(symbols: list[str]) -> dict[str, tuple[float,float]]:
     syms_tuple = tuple(symbols)
+    # 1) Yahoo (with retry/backoff on 401/403)
     yahoo_out = {}
     try:
         for i in range(2):
@@ -108,6 +109,7 @@ def fetch_quotes(symbols: list[str]) -> dict[str, tuple[float,float]]:
                 raise
     except Exception:
         yahoo_out = {}
+    # 2) Fill missing from Stooq
     missing = [s for s in symbols if s not in yahoo_out or math.isnan(yahoo_out[s][0])]
     stq_out = {}
     if missing:
@@ -123,7 +125,7 @@ def fetch_quotes(symbols: list[str]) -> dict[str, tuple[float,float]]:
 @st.cache_data(ttl=600)
 def yahoo_history(symbol: str, start_dt: datetime, end_dt: datetime, interval: str = "1d") -> pd.Series:
     p1 = int(start_dt.replace(tzinfo=ZoneInfo("UTC")).timestamp())
-    p2 = int((end_dt + timedelta(days=1)).replace(tzinfo=ZoneInfo("UTC")).timestamp())  # inclusive
+    p2 = int((end_dt + timedelta(days=1)).replace(tzinfo=ZoneInfo("UTC")).timestamp())  # inclusive end
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
     r = requests.get(url, params={"period1": p1, "period2": p2, "interval": interval, "events": "div,splits"},
                      headers=UA, timeout=10)
@@ -219,6 +221,7 @@ else:
     if prices.empty:
         st.warning("No overlapping dates across tickers in the selected range.")
     else:
+        # Units fixed at window start
         first_row = prices.iloc[0]
         units = {}
         for t in TICKERS:
@@ -227,6 +230,7 @@ else:
             else:
                 units[t] = 0.0
 
+        # Portfolio series
         port_val = (prices * pd.Series(units)).sum(axis=1); port_val.name = "Portfolio Value ($)"
         start_val = float(port_val.iloc[0])
         port_pct = (port_val / start_val - 1.0) * 100.0 if start_val > 0 else port_val*0; port_pct.name = "Return (%)"
@@ -244,7 +248,7 @@ else:
         ret_usd   = end_val - start_val
         ret_pct   = (end_val/start_val - 1.0) * 100.0 if start_val > 0 else 0.0
 
-        # Charts (Altair, explicit axes)
+        # Charts (Altair)
         val_df = port_val.reset_index(); val_df.columns = ["date","value_usd"]
         chart_val = (
             alt.Chart(val_df).mark_line().encode(
@@ -265,20 +269,56 @@ else:
         )
         st.altair_chart(chart_pct, use_container_width=True)
 
-        d1, d2, d3, d4, d5 = st.columns(5)
-        d1.metric("Start value", f"${start_val:,.2f}")
-        d2.metric("End value",   f"${end_val:,.2f}", f"{ret_pct:.2f}%")
-        d3.metric("Period P&L ($)", f"{ret_usd:,.2f}")
-        d4.metric("Max drawdown (%)", f"{max_dd_pct:.2f}%")
-        d5.metric("Max drawdown ($)", f"{mdd_usd:,.2f}")
+        # ---- OPTIONAL window‑linked holdings table ----
+        link_tb = st.checkbox("Make holdings reflect timeframe (units fixed at start date)", value=False)
+        if link_tb:
+            p0 = prices.iloc[0]  # start-date prices
+            p1 = prices.iloc[-1] # end-date prices
+            win_rows = []
+            for t in TICKERS:
+                if t in prices.columns and all([
+                    isinstance(p0[t], (float, int)), isinstance(p1[t], (float, int)),
+                    not math.isnan(p0[t]), not math.isnan(p1[t]), p0[t] > 0
+                ]):
+                    alloc = total_usd * weights[t]
+                    u = alloc / p0[t]
+                    start_val_t = alloc
+                    end_val_t   = u * p1[t]
+                    delta_usd   = end_val_t - start_val_t
+                    delta_pct   = (end_val_t / start_val_t - 1.0) * 100.0
+                    win_rows.append({
+                        "Ticker": t,
+                        "Start Price ($)": round(p0[t], 2),
+                        "End Price ($)":   round(p1[t], 2),
+                        "Units":           round(u, 4),
+                        "Start Value $":   round(start_val_t, 2),
+                        "End Value $":     round(end_val_t, 2),
+                        "Δ $":             round(delta_usd, 2),
+                        "Δ %":             round(delta_pct, 2),
+                    })
+            if win_rows:
+                win_tbl = pd.DataFrame(win_rows)
+                st.subheader("Holdings (tied to selected timeframe)")
+                st.dataframe(win_tbl, use_container_width=True)
 
+                tot_start = float(win_tbl["Start Value $"].sum())
+                tot_end   = float(win_tbl["End Value $"].sum())
+                tot_pl    = tot_end - tot_start
+                tot_pct   = (tot_end / tot_start - 1.0) * 100.0 if tot_start > 0 else 0.0
+                cA, cB, cC = st.columns(3)
+                cA.metric("Start (window)", f"${tot_start:,.2f}")
+                cB.metric("End (window)",   f"${tot_end:,.2f}")
+                cC.metric("Window P/L",     f"${tot_pl:,.2f}", f"{tot_pct:.2f}%")
+            else:
+                st.info("Not enough overlapping data to build a window‑based holdings table.")
+
+        # CSV download for history
         csv_bytes = pd.concat([port_val, port_pct], axis=1).to_csv(index=True).encode()
         st.download_button("Download portfolio history (CSV)", csv_bytes,
                            file_name="portfolio_history.csv", mime="text/csv")
 
         # ---------- Forecast (probability view) ----------
         st.markdown("### Forecast (probability view)")
-
         fc_col1, fc_col2, fc_col3 = st.columns([1,1,2])
         horizon_days = fc_col1.number_input("Horizon (trading days)", min_value=5, max_value=60, value=21, step=1)
         n_sims       = fc_col2.number_input("Simulations", min_value=500, max_value=10000, value=4000, step=500)
@@ -377,7 +417,6 @@ else:
                 "Return threshold (%)": levels,
                 "Prob( ≥ threshold ) %": np.round(probs_levels, 1)
             })
-
             st.markdown("**Risk / Return summary**")
             st.dataframe(summary, use_container_width=True)
             st.markdown("**Threshold probabilities**")
