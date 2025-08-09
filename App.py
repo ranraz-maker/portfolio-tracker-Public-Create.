@@ -1,16 +1,17 @@
-import math
-import requests
-import numpy as np
-import pandas as pd
-import streamlit as st
+import math, time, requests
+import numpy as np, pandas as pd, streamlit as st
 
 st.set_page_config(page_title="Aggressive but Balanced – 1M Tracker", layout="wide")
+st.write("✅ App booted… loading quotes")
 
 # ---- CONFIG ----
-TICKERS = ["OKLO", "SHLD", "ARKG", "CIBR", "NVDA", "TSLA", "URA"]
+TICKERS = ["OKLO","SHLD","ARKG","CIBR","NVDA","TSLA","URA"]
 DEFAULT_WEIGHTS = {"OKLO":0.16,"SHLD":0.16,"ARKG":0.16,"CIBR":0.16,"NVDA":0.16,"TSLA":0.08,"URA":0.12}
 DEFAULT_NIS = 10000.0
 DEFAULT_FX  = 0.27  # NIS→USD
+
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"}
 
 # ---------- Sidebar ----------
 st.sidebar.title("Settings")
@@ -21,75 +22,59 @@ st.sidebar.write(f"≈ **${total_usd:,.2f} USD**")
 st.sidebar.markdown("---")
 st.sidebar.write("**Weights** (sum to 1.00)")
 
-weights = {}
-sum_w = 0.0
+weights, s = {}, 0.0
 for t in TICKERS:
     w = st.sidebar.number_input(f"{t} weight", value=float(DEFAULT_WEIGHTS[t]), step=0.01,
                                 min_value=0.0, max_value=1.0, key=f"w_{t}")
-    weights[t] = float(w)
-    sum_w += float(w)
-
-if abs(sum_w - 1.0) > 1e-6:
-    st.sidebar.error(f"Weights sum to {sum_w:.2f}. They must sum to 1.00.")
+    weights[t] = float(w); s += float(w)
+if abs(s - 1.0) > 1e-6:
+    st.sidebar.error(f"Weights sum to {s:.2f}. They must sum to 1.00.")
     st.stop()
 
-# ---------- Title ----------
 st.title("Aggressive but Balanced – 1-Month Portfolio Tracker")
 st.caption("Live prices, P/L and allocations. Info only, not investment advice.")
 
-# ---------- Data fetchers (requests) ----------
-@st.cache_data(ttl=60)
-def fetch_quotes(symbols: list[str]) -> dict[str, tuple[float, float]]:
-    """
-    Returns dict: symbol -> (last_price, previous_close).
-    Uses Yahoo Finance quote API (no key).
-    """
+# ---------- Fetchers ----------
+def _quote_call(symbols: list[str]) -> dict:
     url = "https://query1.finance.yahoo.com/v7/finance/quote"
-    r = requests.get(url, params={"symbols": ",".join(symbols)}, timeout=10)
+    r = requests.get(url, params={"symbols": ",".join(symbols)}, headers=UA, timeout=10)
     r.raise_for_status()
-    result = r.json().get("quoteResponse", {}).get("result", [])
-    out = {}
-    for d in result:
-        sym = d.get("symbol")
-        price = d.get("regularMarketPrice")
-        prev  = d.get("regularMarketPreviousClose", price)
-        if sym:
-            p = float(price) if price is not None else float("nan")
-            pc = float(prev)  if prev  is not None else float("nan")
-            out[sym] = (p, pc)
-    # ensure all requested symbols present (even if missing)
-    for s in symbols:
-        out.setdefault(s, (float("nan"), float("nan")))
-    return out
+    return r.json()
 
-@st.cache_data(ttl=120)
-def fetch_spark(symbols: list[str], range_code: str = "5d", interval: str = "1d") -> pd.DataFrame:
-    """
-    Tiny history for sparkline chart. Returns DataFrame with columns per symbol.
-    """
-    # Yahoo "spark" endpoint (undocumented but stable for small use)
-    url = "https://query1.finance.yahoo.com/v8/finance/spark"
-    r = requests.get(url, params={"symbols": ",".join(symbols),
-                                  "range": range_code, "interval": interval}, timeout=10)
-    r.raise_for_status()
-    data = r.json().get("spark", {}).get("result", [])
-    frames = {}
-    for item in data:
-        sym = item.get("symbol")
-        series = item.get("response", [{}])[0].get("indicators", {}).get("quote", [{}])[0].get("close", [])
-        frames[sym] = pd.Series(series, dtype="float64")
-    # Align length
-    df = pd.DataFrame(frames)
-    return df
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_quotes(symbols: list[str]) -> dict[str, tuple[float, float]]:
+    # retry up to 3 times with small backoff
+    last_err = None
+    for i in range(3):
+        try:
+            data = _quote_call(symbols)
+            result = data.get("quoteResponse", {}).get("result", [])
+            out = {}
+            for d in result:
+                sym = d.get("symbol")
+                price = d.get("regularMarketPrice")
+                prev  = d.get("regularMarketPreviousClose", price)
+                if sym:
+                    p = float(price) if price is not None else float("nan")
+                    pc = float(prev)  if prev  is not None else float("nan")
+                    out[sym] = (p, pc)
+            # ensure keys for all symbols
+            for s in symbols:
+                out.setdefault(s, (float("nan"), float("nan")))
+            return out
+        except Exception as e:
+            last_err = e
+            time.sleep(0.8 * (i + 1))
+    raise last_err
 
-# ---------- Fetch quotes ----------
+# ---------- Quotes ----------
 try:
     quotes = fetch_quotes(TICKERS)
 except Exception as e:
-    st.error(f"Price download failed. Try again in a minute. ({e})")
+    st.error(f"Price download failed. Please refresh in a minute. Details: {e}")
     st.stop()
 
-# ---------- Build table ----------
+# ---------- Table ----------
 rows = []
 for t in TICKERS:
     price, prev = quotes.get(t, (float("nan"), float("nan")))
@@ -112,7 +97,6 @@ tbl = pd.DataFrame(rows)
 tbl["Δ Value $"] = (tbl["Position Value $"] - tbl["Alloc $"]).round(2)
 tbl["Δ %"] = ((tbl["Position Value $"] / tbl["Alloc $"] - 1.0) * 100.0).replace([np.inf, -np.inf], 0).fillna(0).round(2)
 
-# ---------- Display ----------
 st.subheader("Holdings")
 st.dataframe(tbl, use_container_width=True)
 
@@ -124,20 +108,5 @@ c1.metric("Total Value ($)", f"{total_val:,.2f}")
 c2.metric("Daily P/L ($)",   f"{pl_val:,.2f}")
 c3.metric("Daily P/L (%)",   f"{pl_pct:.2f}%")
 
-# ---------- Spark chart (last 5 sessions) ----------
-try:
-    spark = fetch_spark(TICKERS, range_code="5d", interval="1d").pct_change().dropna()
-    if not spark.empty:
-        st.subheader("Last 5 sessions – daily returns")
-        st.line_chart(spark)
-except Exception:
-    # Silently skip chart if spark endpoint hiccups
-    pass
-
-# Highlight movers
-movers = tbl[ tbl["Day %"].abs() > 3.0 ]
-if len(movers) > 0:
-    st.warning("Movers > 3%: " + ", ".join([f"{r.Ticker} ({r['Day %']}%)" for _, r in movers.iterrows()]))
-
-st.caption("Quotes cached ~60s. Weights must sum to 1.00.")
-
+# Optional: spark chart can be added later; focusing on stable quotes first.
+st.caption("Quotes cached ~60s. If prices don't appear, tap the ↻ in the top-right menu to rerun.")
